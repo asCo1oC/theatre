@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+artifacts/
+research/*.html
+research/*.headers.txt
+!research/ogatt_poster.html
+.pytest_cache/
