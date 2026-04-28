@@ -4,17 +4,11 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HEADFUL=true \
     DEBIAN_FRONTEND=noninteractive \
     TZ=Europe/Monaco
 
-# System packages for a lightweight remote desktop stack and the app runtime.
+# Install minimal runtime deps and tini for proper PID 1 handling
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    xvfb \
-    x11vnc \
-    fluxbox \
-    novnc \
-    websockify \
     tini \
     curl \
     ca-certificates \
@@ -29,8 +23,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 5900 6080 8080
+# Only expose a port for optional web UI in future; bot itself doesn't need exposed ports
+EXPOSE 8080
 
+# Copy an entrypoint which will start the bot automatically
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

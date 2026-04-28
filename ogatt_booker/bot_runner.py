@@ -50,10 +50,10 @@ async def run_integrated_system(
         # С начальными параметрами (для тестирования)
         python -m ogatt_booker.bot_runner --title "Война и мир" --seats 2
     """
-    # Получаем токен
-    token = tg_token or os.getenv("TELEGRAM_BOT_TOKEN")
+    # Получаем токен (поддерживаем оба имена переменных)
+    token = tg_token or os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        log_error("TELEGRAM_BOT_TOKEN не установлен", context={})
+        log_error("TG_BOT_TOKEN или TELEGRAM_BOT_TOKEN не установлен", context={})
         return
     
     log_info("Инициализация интегрированной системы", {})
