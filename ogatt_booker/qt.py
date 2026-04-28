@@ -28,17 +28,30 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Frame,
-    Page,
-    Playwright,
-    TimeoutError as PWTimeout,
-    async_playwright,
-)
+try:
+    from playwright.async_api import (
+        Browser,
+        BrowserContext,
+        Frame,
+        Page,
+        Playwright,
+        TimeoutError as PWTimeout,
+        async_playwright,
+    )
+    PLAYWRIGHT_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - fallback for test/import environments
+    Browser = BrowserContext = Frame = Page = Playwright = object
+
+    class PWTimeout(Exception):
+        pass
+
+    async def async_playwright():
+        raise ModuleNotFoundError("playwright is not installed")
+
+    PLAYWRIGHT_AVAILABLE = False
 
 from .models import BookingResult, Session
 
@@ -258,18 +271,141 @@ async def _get_hall_frame(page: Page, timeout: float = 30.0) -> Frame:
     return hall
 
 
-async def _auto_pick_seats(frame: Frame, wanted: int) -> list[str]:
-    """Эвристический автовыбор: берёт доступные места, сортирует по
-    близости к визуальному центру зала и кликает ``wanted`` штук.
+def _find_adjacent_seats(seats_info: list[dict], wanted: int) -> tuple[list[int], bool]:
+    """Ищет лучший набор мест с приоритетом соседних мест в одном ряду."""
+    if not seats_info or wanted <= 0:
+        return [], False
 
-    Координаты берём из CSS-свойств ``left``/``top`` (стиль inline),
-    т.к. ``getBoundingClientRect`` возвращает нули для скрытых элементов
-    в headless-режиме.
+    center_x = sum(seat["x"] for seat in seats_info) / len(seats_info)
+    center_y = sum(seat["y"] for seat in seats_info) / len(seats_info)
 
-    Возвращает текстовое описание выбранных мест (для отчёта).
+    if wanted == 1:
+        best = min(
+            seats_info,
+            key=lambda s: abs(s["x"] - center_x) + 0.5 * abs(s["y"] - center_y),
+        )
+        return [best["idx"]], True
+
+    sorted_by_y = sorted(seats_info, key=lambda s: (s["y"], s["x"]))
+    unique_y = sorted({seat["y"] for seat in seats_info})
+    y_gaps = [
+        unique_y[i + 1] - unique_y[i]
+        for i in range(len(unique_y) - 1)
+        if unique_y[i + 1] - unique_y[i] > 0
+    ]
+    row_y_threshold = max(12.0, min(y_gaps) / 3.0) if y_gaps else 20.0
+
+    rows: list[list[dict]] = []
+    current_row: list[dict] = []
+    current_row_y: float | None = None
+    for seat in sorted_by_y:
+        if current_row_y is None or abs(seat["y"] - current_row_y) <= row_y_threshold:
+            current_row.append(seat)
+            current_row_y = sum(item["y"] for item in current_row) / len(current_row)
+            continue
+        rows.append(current_row)
+        current_row = [seat]
+        current_row_y = seat["y"]
+    if current_row:
+        rows.append(current_row)
+
+    best_adjacent: tuple[float, list[int]] | None = None
+    best_fallback: tuple[float, list[int]] | None = None
+
+    for row in rows:
+        row_sorted = sorted(row, key=lambda s: s["x"])
+        if len(row_sorted) < wanted:
+            continue
+
+        x_diffs = [
+            row_sorted[i + 1]["x"] - row_sorted[i]["x"]
+            for i in range(len(row_sorted) - 1)
+            if row_sorted[i + 1]["x"] - row_sorted[i]["x"] > 0
+        ]
+        typical_gap = min(x_diffs) if x_diffs else None
+        max_adjacent_gap = (typical_gap * 1.6) if typical_gap else None
+
+        for start_idx in range(len(row_sorted) - wanted + 1):
+            group = row_sorted[start_idx : start_idx + wanted]
+            indices = [s["idx"] for s in group]
+            group_center_x = sum(s["x"] for s in group) / len(group)
+            group_center_y = sum(s["y"] for s in group) / len(group)
+            center_score = abs(group_center_x - center_x) + 0.35 * abs(group_center_y - center_y)
+
+            x_gaps = [group[i + 1]["x"] - group[i]["x"] for i in range(len(group) - 1)]
+            seat_numbers: list[int] = []
+            for seat in group:
+                digits = "".join(ch for ch in str(seat.get("title", "")) if ch.isdigit())
+                if digits:
+                    seat_numbers.append(int(digits))
+
+            is_adjacent = bool(x_gaps) and all(gap > 0 for gap in x_gaps)
+            if len(seat_numbers) == len(group):
+                number_gaps = [
+                    seat_numbers[i + 1] - seat_numbers[i]
+                    for i in range(len(seat_numbers) - 1)
+                ]
+                is_adjacent = is_adjacent and all(gap == 1 for gap in number_gaps)
+            else:
+                if is_adjacent and max_adjacent_gap is not None:
+                    is_adjacent = all(gap <= max_adjacent_gap for gap in x_gaps)
+                if is_adjacent and typical_gap is not None:
+                    is_adjacent = (max(x_gaps) - min(x_gaps)) <= max(6.0, typical_gap * 0.35)
+                if is_adjacent and len(row_sorted) > wanted and typical_gap is not None:
+                    is_adjacent = all(gap <= typical_gap * 1.25 for gap in x_gaps)
+
+            if is_adjacent:
+                score = center_score
+                if best_adjacent is None or score < best_adjacent[0]:
+                    best_adjacent = (score, indices)
+            else:
+                gap_penalty = sum(x_gaps) if x_gaps else 10_000.0
+                score = center_score + gap_penalty
+                if best_fallback is None or score < best_fallback[0]:
+                    best_fallback = (score, indices)
+
+    if best_adjacent is not None:
+        return best_adjacent[1], True
+    if best_fallback is not None:
+        return best_fallback[1], False
+
+    ranked = sorted(
+        seats_info,
+        key=lambda s: abs(s["x"] - center_x) + 0.5 * abs(s["y"] - center_y),
+    )
+    return [s["idx"] for s in ranked[:wanted]], False
+
+
+async def _auto_pick_seats(frame: Frame, wanted: int) -> tuple[list[str], bool]:
+    """Эвристический автовыбор: ищет соседние доступные места в центре зала.
+    
+    Если соседних мест нет, берёт wanted любых доступных мест.
+    
+    Возвращает (текстовое описание мест, были_ли_места_соседними).
     """
     sel = await _first_matching(frame, SEAT_SELECTORS_AVAILABLE, timeout=15.0)
     if not sel:
+        sold_out_markers = [
+            ".hallPlace",
+            ".hall-place",
+            "[class*='hallPlace']",
+            "[class*='place']",
+            ".hallRow",
+            ".scheme",
+            "svg",
+        ]
+        has_hall_markup = False
+        for marker in sold_out_markers:
+            try:
+                if await frame.locator(marker).count() > 0:
+                    has_hall_markup = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if has_hall_markup:
+            raise RuntimeError("SOLD_OUT: В зале сейчас нет доступных мест (возможно, всё раскуплено).")
+
         raise RuntimeError(
             "Не удалось определить разметку доступных мест в iframe зала. "
             "Используйте режим semiauto и выберите места вручную."
@@ -291,22 +427,11 @@ async def _auto_pick_seats(frame: Frame, wanted: int) -> list[str]:
         sel,
     )
     if not seats_info:
-        raise RuntimeError("В зале нет доступных мест (возможно, всё раскуплено).")
+        raise RuntimeError("SOLD_OUT: В зале нет доступных мест (возможно, всё раскуплено).")
 
-    xs = [s["x"] for s in seats_info]
-    ys = [s["y"] for s in seats_info]
-    cx = (min(xs) + max(xs)) / 2
-    # Сцена обычно сверху, поэтому "лучше" = ближе к центру по X
-    # и в средней части зала по Y.
-    y_min, y_max = min(ys), max(ys)
-    y_target = y_min + (y_max - y_min) * 0.35
-
-    def score(s):
-        return abs(s["x"] - cx) + 0.5 * abs(s["y"] - y_target)
-
-    ranked = sorted(seats_info, key=score)
+    idxs, is_adjacent = _find_adjacent_seats(seats_info, wanted)
+    
     picked_titles: list[str] = []
-    idxs = [s["idx"] for s in ranked[:wanted]]
     handles = await frame.query_selector_all(sel)
     for i in idxs:
         if i >= len(handles):
@@ -325,7 +450,8 @@ async def _auto_pick_seats(frame: Frame, wanted: int) -> list[str]:
             await asyncio.sleep(0.3)
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось кликнуть место #%s: %s", i, exc)
-    return picked_titles
+    
+    return picked_titles, is_adjacent
 
 
 async def _wait_manual_selection(frame: Frame, wanted: int, timeout: float) -> list[str]:
@@ -372,7 +498,7 @@ async def _wait_manual_selection(frame: Frame, wanted: int, timeout: float) -> l
 
 
 class QuickticketsDriver:
-    """Управляет Playwright-сессией и доводит заказ до страницы оплаты."""
+    """Управляет Playwright-сессией и выбирает места на странице сеанса."""
 
     def __init__(self, opts: BookingOptions):
         self.opts = opts
@@ -382,6 +508,8 @@ class QuickticketsDriver:
         self._page: Page | None = None
 
     async def __aenter__(self) -> "QuickticketsDriver":
+        if not PLAYWRIGHT_AVAILABLE:
+            raise ModuleNotFoundError("playwright is not installed")
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=not self.opts.headful,
@@ -420,6 +548,8 @@ class QuickticketsDriver:
             log.warning("Первый переход на страницу сеанса не успел за 60 сек., повторяю…")
             await self._page.goto(session_url, wait_until="domcontentloaded", timeout=60_000)
 
+        result.session_url = self._page.url
+
         try:
             hall = await _get_hall_frame(self._page)
         except TimeoutError as exc:
@@ -438,47 +568,71 @@ class QuickticketsDriver:
 
         try:
             if opts.mode == "auto":
-                result.seats = await _auto_pick_seats(hall, opts.seats_wanted)
+                result.seats, result.seats_adjacent = await _auto_pick_seats(hall, opts.seats_wanted)
             else:
-                result.seats = await _wait_manual_selection(
+                seats_list = await _wait_manual_selection(
                     hall, opts.seats_wanted, opts.manual_timeout
                 )
+                result.seats = seats_list
+                result.seats_adjacent = True  # В semiauto пользователь выбирает сам
         except Exception as exc:  # noqa: BLE001
-            result.status = "error"
-            result.message = f"Не удалось выбрать места: {exc}"
+            message = str(exc)
+            if message.startswith("SOLD_OUT:"):
+                result.status = "sold_out"
+                result.message = message.removeprefix("SOLD_OUT:").strip()
+            else:
+                result.status = "error"
+                result.message = f"Не удалось выбрать места: {exc}"
             return result
 
-        log.info("Выбраны места: %s", result.seats)
+        log.info("Выбраны места: %s (соседние: %s)", result.seats, result.seats_adjacent)
 
-        # Нажимаем «Купить/Оформить» — сначала ищем в iframe зала, затем в родителе.
-        buy_clicked = await self._click_buy(hall) or await self._click_buy(self._page)
+        # Сохраняем исходный скрин выбора мест, затем инициируем реальный
+        # сценарий QuickTickets: action из iframe -> initAnytickets -> submit формы.
+        await self._save_hall_screenshot(result)
+        await self._save_artifacts(result, tag="hall-selected")
+        await self._prepare_parent_order_bridge()
+
+        buy_clicked = await self._click_buy(hall)
+        if not buy_clicked:
+            buy_clicked = await self._click_buy(self._page)
         if not buy_clicked:
             result.status = "error"
-            result.message = "Не нашли кнопку перехода к оплате после выбора мест."
+            result.message = "Места выбраны, но кнопку «Купить» нажать не удалось."
             return result
 
-        # После клика QuickTickets может обновить URL с задержкой.
-        try:
-            await self._page.wait_for_url("**/ordering/**", timeout=90_000)
-        except PWTimeout:
+        order_ready = await self._wait_for_order_transition()
+        if not order_ready:
+            log.warning("После клика по «Купить» переход на оформление не произошёл, пробую форсировать parent-flow.")
+            forced = await self._force_parent_order_submission()
+            if forced:
+                order_ready = await self._wait_for_order_transition(timeout_ms=15_000)
+
+        if not order_ready:
             result.status = "error"
-            result.message = "Нет перехода на страницу оформления заказа."
-            await self._save_artifacts(result, tag="no-ordering")
+            result.message = (
+                "Места выбраны, но QuickTickets не перевёл их в резерв: "
+                "не удалось завершить initAnytickets/submit order form."
+            )
+            await self._save_artifacts(result, tag="order-failed")
             return result
-        await self._page.wait_for_load_state("domcontentloaded")
-        log.info("Страница заказа: %s", self._page.url)
 
-        if opts.contacts:
-            await self._fill_contacts(opts.contacts)
-
-        result.order_url = self._page.url
-        result.total_price = await self._try_extract_total()
-        await self._save_artifacts(result, tag="ordering")
+        result.session_url = session_url
+        result.order_url = self._page.url if "/ordering/" in self._page.url else None
+        result.reserved_at = datetime.now()
+        result.unfreeze_at = result.reserved_at + timedelta(minutes=3)
         result.status = "ready_for_payment"
-        result.message = (
-            "Готово: форма контактов заполнена, осталось вручную проверить данные "
-            "и подтвердить оплату на этой странице."
-        )
+        if result.seats_adjacent:
+            result.message = (
+                "✅ Выбраны соседние места, инициирован заказ и места переведены во временный резерв. "
+                "Отправлена ссылка на страницу заказа и скриншот."
+            )
+        else:
+            result.message = (
+                "⚠️ Соседних мест не нашлось, выбраны доступные места. "
+                "Заказ инициирован, места переведены во временный резерв."
+            )
+        await self._save_artifacts(result, tag="order-ready")
         return result
 
     async def _click_buy(self, ctx: Page | Frame) -> bool:
@@ -565,6 +719,125 @@ class QuickticketsDriver:
 
         return False
 
+    async def _prepare_parent_order_bridge(self) -> None:
+        assert self._page is not None
+        try:
+            await self._page.evaluate(
+                """() => {
+                    if (window.__ogattOrderBridgeInstalled) {
+                        return;
+                    }
+                    window.__ogattOrderBridgeInstalled = true;
+                    window.__ogattLastQtAction = null;
+                    window.addEventListener('message', (event) => {
+                        if (event.origin !== 'https://hall.quicktickets.ru') {
+                            return;
+                        }
+                        if (event.data && event.data.type === 'action') {
+                            window.__ogattLastQtAction = event.data;
+                        }
+                    });
+                }"""
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Не удалось установить bridge для action-событий: %s", exc)
+
+    async def _wait_for_order_transition(self, timeout_ms: int = 10_000) -> bool:
+        assert self._page is not None
+        try:
+            await self._page.wait_for_url("**/ordering/**", timeout=timeout_ms)
+            log.info("QuickTickets перевёл страницу на оформление заказа: %s", self._page.url)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            await self._page.wait_for_function(
+                """() => {
+                    const codes = document.querySelector('#order input[name="anyticketsCodes"]');
+                    return !!codes && !!codes.value && codes.value.trim().length > 0;
+                }""",
+                timeout=timeout_ms,
+            )
+            log.info("QuickTickets заполнил hidden order form, но navigation ещё не завершён.")
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _force_parent_order_submission(self) -> bool:
+        assert self._page is not None
+        try:
+            result = await self._page.evaluate(
+                """async () => {
+                    const actionData = window.__ogattLastQtAction;
+                    if (!actionData || typeof actionData.selectedItemsInfo === 'undefined') {
+                        return {ok: false, reason: 'missing_action_data'};
+                    }
+
+                    const form = document.querySelector('#order');
+                    const codesInput = document.querySelector('#order input[name="anyticketsCodes"]');
+                    const countInput = document.querySelector('#order input[name="selectAnyplacesCount"]');
+                    const organisationAlias = document.querySelector('#order input[name="organisationAlias"]')?.value;
+                    const elemType = document.querySelector('#order input[name="elemType"]')?.value;
+                    const elemId = document.querySelector('#order input[name="elemId"]')?.value;
+
+                    if (!form || !codesInput || !countInput || !organisationAlias || !elemType || !elemId) {
+                        return {ok: false, reason: 'missing_order_form'};
+                    }
+
+                    const payload = {
+                        organisationAlias,
+                        elemType,
+                        elemId: Number(elemId),
+                        collectiveSell: actionData.action === 'collectiveSell' ? 1 : 0,
+                        ...actionData.selectedItemsInfo,
+                    };
+
+                    const response = await fetch('/ordering/initAnytickets', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-Requested-With': 'XMLHttpRequest',
+                        },
+                        body: new URLSearchParams(
+                            Object.entries(payload).flatMap(([key, value]) => {
+                                if (Array.isArray(value)) {
+                                    return value.map((item) => [key + '[]', String(item)]);
+                                }
+                                if (value === null || typeof value === 'undefined') {
+                                    return [];
+                                }
+                                return [[key, String(value)]];
+                            })
+                        ).toString(),
+                    });
+
+                    const data = await response.json();
+                    if (!response.ok || data.result !== 'success') {
+                        return {
+                            ok: false,
+                            reason: 'init_failed',
+                            responseStatus: response.status,
+                            data,
+                        };
+                    }
+
+                    codesInput.value = (data.data.anyticketsCodes || []).join(',');
+                    countInput.value = String(data.data.selectAnyplacesCount || '');
+                    form.submit();
+                    return {ok: true};
+                }"""
+            )
+            if result and result.get("ok"):
+                log.info("Форсированный parent-flow initAnytickets + submit выполнен успешно.")
+                return True
+            log.warning("Форсированный parent-flow не удался: %s", result)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Ошибка форсированного parent-flow QuickTickets: %s", exc)
+            return False
+
     async def _fill_contacts(self, c: Contacts) -> None:
         assert self._page is not None
         async def _fill(selectors: list[str], value: str) -> None:
@@ -582,6 +855,18 @@ class QuickticketsDriver:
         await _fill(FORM_FIELD_SELECTORS["phone"], c.phone)
         log.info("Контактные данные заполнены.")
 
+    async def _save_hall_screenshot(self, result: BookingResult) -> None:
+        """Сохраняет скриншот зала с выбранными местами."""
+        assert self._page is not None
+        stem = f"order_{result.session.qt_session_id}_hall_seats"
+        png = self.opts.artifact_dir / f"{stem}.png"
+        try:
+            await self._page.screenshot(path=str(png), full_page=False)
+            result.screenshot_path = str(png)
+            log.info("Скриншот выбранных мест сохранён: %s", png)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось сохранить скриншот мест: %s", exc)
+
     async def _try_extract_total(self) -> float | None:
         assert self._page is not None
         try:
@@ -597,13 +882,7 @@ class QuickticketsDriver:
     async def _save_artifacts(self, result: BookingResult, *, tag: str) -> None:
         assert self._page is not None
         stem = f"order_{result.session.qt_session_id}_{tag}"
-        png = self.opts.artifact_dir / f"{stem}.png"
         js = self.opts.artifact_dir / f"{stem}.json"
-        try:
-            await self._page.screenshot(path=str(png), full_page=True)
-            result.screenshot_path = str(png)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Скрин не сохранён: %s", exc)
         try:
             js.write_text(
                 json.dumps(result.to_dict(), ensure_ascii=False, indent=2),

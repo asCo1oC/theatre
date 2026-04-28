@@ -1,0 +1,18 @@
+HTTP/2 200 
+server: ddos-guard
+set-cookie: __ddg8_=WpePsuVuiZRnDpWI; Domain=.quicktickets.ru; Path=/; Expires=Thu, 23-Apr-2026 15:00:31 GMT
+set-cookie: __ddg10_=1776955231; Domain=.quicktickets.ru; Path=/; Expires=Thu, 23-Apr-2026 15:00:31 GMT
+set-cookie: __ddg9_=185.181.61.31; Domain=.quicktickets.ru; Path=/; Expires=Thu, 23-Apr-2026 15:00:31 GMT
+content-security-policy: upgrade-insecure-requests;
+set-cookie: __ddg1_=y8DfTr5YgbngURP1MsDo; Domain=.quicktickets.ru; HttpOnly; Path=/; Expires=Fri, 23-Apr-2027 14:40:31 GMT
+date: Thu, 23 Apr 2026 14:40:31 GMT
+content-type: text/html; charset=UTF-8
+vary: Accept-Encoding
+set-cookie: PHPSESSID=hsur1s6h9lhkv8scusivmqc2mn; path=/
+expires: Thu, 19 Nov 1981 08:52:00 GMT
+cache-control: no-store, no-cache, must-revalidate
+pragma: no-cache
+set-cookie: cityId=528; expires=Wed, 22-Jul-2026 14:40:31 GMT; Max-Age=7776000; path=/; SameSite=Lax
+set-cookie: cityId=deleted; expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0; path=/; SameSite=Lax
+set-cookie: cityId=528; expires=Wed, 22-Jul-2026 14:40:31 GMT; Max-Age=7776000; path=/; SameSite=Lax
+

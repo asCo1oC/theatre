@@ -2,9 +2,8 @@
 
 Логика:
 1. Каждые ``interval`` секунд загружает афишу и ищет сеансы по названию.
-2. При появлении нового сеанса (которого раньше не было) запускает
-   ``QuickticketsDriver`` в режиме ``auto`` и бронирует ``seats_wanted`` мест.
-3. Отправляет ссылку на оплату в Telegram.
+2. При появлении нового сеанса запускает ``QuickticketsDriver`` в режиме ``auto``.
+3. Выбирает места, сохраняет скриншот и отправляет ссылку на рассадку в Telegram.
 4. Помечает сеанс как обработанный, чтобы не бронировать повторно.
 """
 from __future__ import annotations
@@ -16,7 +15,7 @@ from pathlib import Path
 
 from .afisha import AfishaFetcher, find_sessions, parse_afisha
 from .models import BookingResult, Session
-from .notifier import notify_console, notify_telegram, write_handoff_artifact
+from .notifier import notify_console, notify_telegram
 from .qt import BookingOptions, Contacts, QuickticketsDriver
 
 log = logging.getLogger(__name__)
@@ -110,19 +109,27 @@ async def watch(
                 await asyncio.sleep(interval)
                 continue
 
-            handoff_path = write_handoff_artifact(result)
-            if handoff_path:
-                result.message = (result.message or "") + f"\nHandoff: {handoff_path}"
+            if result.status in {"ready_for_payment", "seats_reserved"}:
+                if not result.seats_adjacent:
+                    log.warning(
+                        "Соседних мест не было найдено, выбраны доступные места: %s",
+                        result.seats
+                    )
+                else:
+                    log.info("Места выбраны соседние: %s", result.seats)
 
             notify_console(result)
             notify_telegram(result, token=tg_token, chat_id=tg_chat_id)
 
-            if result.status == "ready_for_payment":
+            if result.status in {"ready_for_payment", "seats_reserved"}:
                 booked_count += 1
                 log.info("Успешно забронировано. Всего сеансов: %d", booked_count)
                 if max_sessions and booked_count >= max_sessions:
                     log.info("Достигнут лимит max_sessions=%d, останавливаюсь.", max_sessions)
                     return
+            elif result.status == "sold_out":
+                log.info("На найденном сеансе сейчас нет доступных мест: %s", result.message)
+                booked_ids.discard(target.qt_session_id)
             else:
                 log.warning("Бронирование завершилось со статусом '%s': %s", result.status, result.message)
                 booked_ids.discard(target.qt_session_id)

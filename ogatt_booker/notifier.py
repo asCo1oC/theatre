@@ -1,4 +1,4 @@
-"""Уведомления о готовом к оплате заказе."""
+"""Уведомления о бронировании мест и ссылке на рассадку."""
 from __future__ import annotations
 
 import logging
@@ -7,7 +7,6 @@ from pathlib import Path
 
 import httpx
 
-from .handoff import build_handoff_html
 from .models import BookingResult
 
 log = logging.getLogger(__name__)
@@ -18,17 +17,16 @@ def format_message(result: BookingResult) -> str:
     lines = [
         f"🎭 {s.title}",
         f"📅 {s.show_date:%d.%m.%Y} {s.show_time:%H:%M} · {s.scene}",
-        f"🎟 Мест: {len(result.seats)}",
+        f"🎟 Забронировано мест: {len(result.seats)}",
     ]
     if result.seats:
         lines.append("  " + ", ".join(result.seats))
+    if not result.seats_adjacent:
+        lines.append("⚠️  Соседних мест не было, выбраны доступные места.")
     if result.total_price:
-        lines.append(f"💰 К оплате: {result.total_price:.0f} ₽")
-    if result.order_url:
-        if result.order_url.rstrip("/").endswith("/ordering/anytickets"):
-            lines.append("🔗 Оформление заказа открыто в браузере")
-        else:
-            lines.append(f"🔗 Оплата: {result.order_url}")
+        lines.append(f"💰 Сумма: {result.total_price:.0f} ₽")
+    if result.session_url:
+        lines.append(f"🔗 Рассадка: {result.session_url}")
     if result.message:
         lines.append("")
         lines.append(result.message)
@@ -38,26 +36,6 @@ def notify_console(result: BookingResult) -> None:
     print("=" * 60)
     print(format_message(result))
     print("=" * 60)
-
-
-
-def write_handoff_artifact(result: BookingResult, handoff_dir: str | Path = "./artifacts/handoff") -> str | None:
-    """Сохраняет HTML-страницу для передачи пользователю на телефон.
-
-    Возвращает относительный путь вида ``artifacts/handoff/...``. Если у вас
-    есть публичный HTTP-слой (nginx, Caddy, static file server), этот путь можно
-    превратить в кликабельную ссылку на уровне уведомления.
-    """
-    try:
-        out_dir = Path(handoff_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        token = f"s{result.session.qt_session_id}"
-        path = out_dir / f"handoff_{token}.html"
-        path.write_text(build_handoff_html(result), encoding="utf-8")
-        return str(path)
-    except Exception:  # noqa: BLE001
-        log.exception("Не удалось записать handoff-artifact")
-        return None
 
 
 
@@ -81,11 +59,13 @@ def notify_telegram(
                 data={"chat_id": chat_id, "text": message, "disable_web_page_preview": "true"},
             )
             resp.raise_for_status()
+            
+            # 2. Отправляем скриншот забронированных мест, если есть
             if result.screenshot_path and Path(result.screenshot_path).exists():
                 with open(result.screenshot_path, "rb") as fh:
                     resp2 = client.post(
                         f"https://api.telegram.org/bot{token}/sendPhoto",
-                        data={"chat_id": chat_id},
+                        data={"chat_id": chat_id, "caption": "📸 Забронированные места"},
                         files={"photo": fh},
                     )
                     resp2.raise_for_status()
