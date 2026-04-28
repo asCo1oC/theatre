@@ -1,3 +1,45 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Pytest cache
+.pytest_cache/
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Environment variables
+.env
+
+# Docker
+docker-compose.override.yml
+
+# Project artifacts and generated assets
+artifacts/
+
+# Coverage
+.coverage
+htmlcov/
 .venv/
 __pycache__/
 *.pyc
